@@ -1,0 +1,12 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+jemallocator = "*"
+camino = "1.1.7"
+memory-stats = "1.2.0"
+smash-hash = { path = "../smash-hash" }
+stats_alloc = "0.1.10"
+bytemuck = "1.16.1"
