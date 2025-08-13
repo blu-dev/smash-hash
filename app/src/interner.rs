@@ -283,15 +283,15 @@ impl HashMemorySlab {
             total_blob_size: self.total_blob_size,
             bytes: MemoryUsageFraction {
                 numer: self.byte_len,
-                denom: unsafe { (*self.bytes).len() },
+                denom: unsafe { (&(*self.bytes)).len() },
             },
             strings: MemoryUsageFraction {
                 numer: self.string_len * std::mem::size_of::<SmolRange>(),
-                denom: unsafe { (*self.strings).len() } * std::mem::size_of::<SmolRange>(),
+                denom: unsafe { (&(*self.strings)).len() } * std::mem::size_of::<SmolRange>(),
             },
             components: MemoryUsageFraction {
                 numer: self.component_len * std::mem::size_of::<u24>(),
-                denom: unsafe { (*self.components).len() } * std::mem::size_of::<u24>(),
+                denom: unsafe { (&(*self.components)).len() } * std::mem::size_of::<u24>(),
             },
             hashes: MemoryUsageFraction {
                 numer: unsafe {
@@ -301,7 +301,7 @@ impl HashMemorySlab {
                         .sum::<usize>()
                         * std::mem::size_of::<HashLookupKey>()
                 },
-                denom: unsafe { (*self.hashes).len() } * std::mem::size_of::<HashLookupKey>(),
+                denom: unsafe { (&(*self.hashes)).len() } * std::mem::size_of::<HashLookupKey>(),
             },
         }
     }
@@ -371,8 +371,8 @@ impl HashMemorySlab {
                 let bytes = component.as_str().as_bytes();
                 let new_len = self.byte_len + bytes.len();
                 unsafe {
-                    (*self.bytes)[self.byte_len..new_len].copy_from_slice(bytes);
-                    (*self.strings)[self.string_len] =
+                    (&mut (*self.bytes))[self.byte_len..new_len].copy_from_slice(bytes);
+                    (&mut (*self.strings))[self.string_len] =
                         SmolRange::new(bytes.len() as u8, u24::from_u32(self.byte_len as u32));
                 }
                 let component_index = u24::from_u32(self.string_len as u32);
@@ -419,7 +419,7 @@ impl HashMemorySlab {
             let len = unsafe { (*self.bucket_lengths)[bucket_idx] as usize };
             let start_idx = bucket_idx * HASH_BUCKET_SIZE;
             unsafe {
-                (*self.hashes)[start_idx..start_idx + len]
+                (&mut (*self.hashes))[start_idx..start_idx + len]
                     .sort_unstable_by(|a, b| a.shifted_hash.cmp(&b.shifted_hash));
             }
         }
@@ -436,7 +436,7 @@ impl HashMemorySlab {
                     let len = unsafe { (*self.bucket_lengths)[bucket] as usize };
                     let start_idx = bucket * HASH_BUCKET_SIZE;
                     unsafe {
-                        if let Ok(local_index) = (*self.hashes)[start_idx..start_idx + len]
+                        if let Ok(local_index) = (&mut (*self.hashes))[start_idx..start_idx + len]
                             .binary_search_by_key(&shifted_hash, |a| a.shifted_hash)
                         {
                             found = Some(u24::from_u32((start_idx + local_index) as u32));
@@ -509,7 +509,8 @@ fn write_hash_by_index(
         } else {
             let string = unsafe { (*slab.strings)[string_idx as usize] };
             let byte_start = string.start().to_u32() as usize;
-            let bytes = unsafe { &(*slab.bytes)[byte_start..byte_start + string.len() as usize] };
+            let bytes =
+                unsafe { &(&(*slab.bytes))[byte_start..byte_start + string.len() as usize] };
             // SAFETY: We take the bytes from a &str to write into this buffer
             f.write_str(unsafe { std::str::from_utf8_unchecked(bytes) })?;
         }
@@ -530,7 +531,7 @@ pub fn write_hash(
     let bucket_idx = hash.crc32() as usize % HASH_BUCKET_COUNT;
     let len = unsafe { (*slab.bucket_lengths)[bucket_idx] };
     let start_idx = bucket_idx * HASH_BUCKET_SIZE;
-    let bucket = unsafe { &(*slab.hashes)[start_idx..start_idx + len as usize] };
+    let bucket = unsafe { &(&(*slab.hashes))[start_idx..start_idx + len as usize] };
 
     let shifted_hash = (hash.raw() >> 8) as u32;
 
