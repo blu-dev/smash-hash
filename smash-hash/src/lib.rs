@@ -27,6 +27,10 @@ impl Hasher for PassHasher {
 pub struct Hash40(u64);
 
 impl Hash40 {
+    pub const fn from_raw(value: u64) -> Self {
+        Self(value & 0x000000FF_FFFFFFFF)
+    }
+
     pub const fn raw(self) -> u64 {
         self.0
     }
