@@ -33,6 +33,22 @@ const CRC_TABLE: [u32; 256] = [
     0xb3667a2e, 0xc4614ab8, 0x5d681b02, 0x2a6f2b94, 0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d,
 ];
 
+const CRC_REVERSE_TABLE: [u32; 256] = [
+    0, 65, 195, 130, 134, 199, 69, 4, 77, 12, 142, 207, 203, 138, 8, 73, 154, 219, 89, 24, 28, 93,
+    223, 158, 215, 150, 20, 85, 81, 16, 146, 211, 117, 52, 182, 247, 243, 178, 48, 113, 56, 121,
+    251, 186, 190, 255, 125, 60, 239, 174, 44, 109, 105, 40, 170, 235, 162, 227, 97, 32, 36, 101,
+    231, 166, 234, 171, 41, 104, 108, 45, 175, 238, 167, 230, 100, 37, 33, 96, 226, 163, 112, 49,
+    179, 242, 246, 183, 53, 116, 61, 124, 254, 191, 187, 250, 120, 57, 159, 222, 92, 29, 25, 88,
+    218, 155, 210, 147, 17, 80, 84, 21, 151, 214, 5, 68, 198, 135, 131, 194, 64, 1, 72, 9, 139,
+    202, 206, 143, 13, 76, 149, 212, 86, 23, 19, 82, 208, 145, 216, 153, 27, 90, 94, 31, 157, 220,
+    15, 78, 204, 141, 137, 200, 74, 11, 66, 3, 129, 192, 196, 133, 7, 70, 224, 161, 35, 98, 102,
+    39, 165, 228, 173, 236, 110, 47, 43, 106, 232, 169, 122, 59, 185, 248, 252, 189, 63, 126, 55,
+    118, 244, 181, 177, 240, 114, 51, 127, 62, 188, 253, 249, 184, 58, 123, 50, 115, 241, 176, 180,
+    245, 119, 54, 229, 164, 38, 103, 99, 34, 160, 225, 168, 233, 107, 42, 46, 111, 237, 172, 10,
+    75, 201, 136, 140, 205, 79, 14, 71, 6, 132, 197, 193, 128, 2, 67, 144, 209, 83, 18, 22, 87,
+    213, 148, 221, 156, 30, 95, 91, 26, 152, 217,
+];
+
 const fn make_odd_matrix() -> [u32; 32] {
     let mut out = [0u32; 32];
     out[0] = 0xedb88320;
@@ -126,6 +142,31 @@ pub const fn hash40_concat(first: u64, second: u64) -> u64 {
     ((len1 + len2) << 32) | crc as u64
 }
 
+pub const fn hash40_undo(first: u64, bytes: &[u8]) -> u64 {
+    let crc1 = (first & 0xffffffff) as u32;
+    let len1 = (first >> 32) & 0xff;
+    if bytes.is_empty() {
+        return first;
+    }
+
+    if len1.saturating_sub(bytes.len() as u64) == 0 {
+        return 0;
+    }
+
+    let mut idx = bytes.len();
+    let mut prev_crc = !crc1;
+    while idx > 0 {
+        idx -= 1;
+        let reverse_idx = (prev_crc >> 24) & 0xFF;
+        let table_idx = CRC_REVERSE_TABLE[reverse_idx as usize];
+        prev_crc =
+            ((prev_crc ^ CRC_TABLE[table_idx as usize]) << 8) | (table_idx ^ bytes[idx] as u32);
+    }
+
+    let new_len = len1 - bytes.len() as u64;
+    (new_len << 32) | !prev_crc as u64
+}
+
 #[test]
 fn test_algorithm() {
     assert_eq!(hash40("".as_bytes()), 0);
@@ -136,4 +177,7 @@ fn test_algorithm() {
         hash40_concat(hash40("hello".as_bytes()), hash40("world".as_bytes())),
         hash40("helloworld".as_bytes())
     );
+    let undo = hash40_undo(hash40("fighter/".as_bytes()), "/".as_bytes());
+    let fighter = hash40("fighter".as_bytes());
+    assert_eq!(undo, fighter, "{undo:#x}, {fighter:#x}");
 }

@@ -49,6 +49,14 @@ impl Hash40 {
         Self(const_hash::hash40(string.as_bytes()))
     }
 
+    pub const fn const_trim_trailing(self, string: &str) -> Self {
+        Self(const_hash::hash40_undo(self.0, string.as_bytes()))
+    }
+
+    pub const fn const_trim_trailing_bytes(self, bytes: &[u8]) -> Self {
+        Self(const_hash::hash40_undo(self.0, bytes))
+    }
+
     pub const fn const_new_bytes(bytes: &[u8]) -> Self {
         Self(const_hash::hash40(bytes))
     }
