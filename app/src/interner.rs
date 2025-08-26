@@ -1,10 +1,11 @@
 use std::{
     alloc::Layout,
-    fmt::{Display, Write},
+    fmt::{Debug, Display, Write},
     num::NonZeroUsize,
     ops::Range,
 };
 
+use bytemuck::{Pod, Zeroable};
 use camino::Utf8Path;
 use smash_hash::{Hash40, Hash40Map};
 
@@ -13,11 +14,11 @@ const IS_INTERNED_COMPONENT: u32 = 1u32 << 23;
 #[derive(Copy, Clone)]
 #[allow(non_camel_case_types)]
 #[repr(transparent)]
-struct u24([u8; 3]);
+pub struct u24([u8; 3]);
 
 impl u24 {
     #[rustfmt::skip]
-    const fn to_u32(self) -> u32 {
+    pub const fn to_u32(self) -> u32 {
         let Self([a, b, c]) = self;
         #[cfg(target_endian = "big")]
         { u32::from_be_bytes([0, a, b, c]) }
@@ -25,7 +26,7 @@ impl u24 {
         { u32::from_le_bytes([a, b, c, 0]) }
     }
 
-    const fn from_u32(n: u32) -> Self {
+    pub const fn from_u32(n: u32) -> Self {
         #[cfg(target_endian = "big")]
         {
             let [a, b, c, d] = n.to_be_bytes();
@@ -59,7 +60,7 @@ const INTERNED_PATH_SLAB_SIZE: usize = (4 * 1024 * 1024) / std::mem::size_of::<u
 /// # Safety
 /// The returned memory from this function is **not** initialized, which means that the caller must
 /// be cautious not to use it to return references to uninitialized memory
-unsafe fn allocate_uninit(size: NonZeroUsize, align: NonZeroUsize) -> Box<[u8]> {
+pub unsafe fn allocate_uninit(size: NonZeroUsize, align: NonZeroUsize) -> Box<[u8]> {
     // PERF: Unwrapping/asserting here is fine, this functinon is only going to get called a handful of times during init
     let layout = Layout::from_size_align(size.get(), align.get()).unwrap();
     assert!(layout.size() > 0);
@@ -91,7 +92,7 @@ unsafe fn allocate_uninit(size: NonZeroUsize, align: NonZeroUsize) -> Box<[u8]> 
 pub struct SmolRange(u32);
 
 impl SmolRange {
-    const fn new(len: u8, start: u24) -> Self {
+    pub const fn new(len: u8, start: u24) -> Self {
         Self(((len as u32) << 24) | start.to_u32())
     }
 
@@ -108,10 +109,18 @@ impl SmolRange {
     }
 }
 
-struct HashLookupKey {
-    shifted_hash: u32,
-    range: SmolRange,
+pub struct HashLookupKey {
+    pub shifted_hash: u32,
+    pub range: SmolRange,
 }
+
+// impl HashLookupKey {
+//     const fn from_hash_and_range(hash: Hash40, range: SmolRange) -> Self {
+//         Self {
+//             shifted_hash: hash
+//         }
+//     }
+// }
 
 #[derive(Default)]
 pub struct InternerCache {
@@ -134,6 +143,8 @@ pub struct HashMemorySlab {
 
     hashes: *mut [HashLookupKey],
     bucket_lengths: *mut [u32],
+
+    was_finalized: bool,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -267,6 +278,7 @@ impl HashMemorySlab {
             component_len: 0,
             hashes: lookup,
             bucket_lengths,
+            was_finalized: false,
         }
     }
 
@@ -324,7 +336,32 @@ impl HashMemorySlab {
         this.byte_len = usize::from_le(slice[0]);
         this.string_len = usize::from_le(slice[1]);
         this.component_len = usize::from_le(slice[2]);
+        this.was_finalized = true;
         this
+    }
+
+    fn try_cache_or_finalized_self(
+        this: &Self,
+        cache: &InternerCache,
+        hash: Hash40,
+    ) -> Option<u24> {
+        cache.cached_paths.get(&hash).copied().or_else(|| {
+            if this.was_finalized {
+                let bucket_idx = hash.crc32() as usize % HASH_BUCKET_COUNT;
+                let len = unsafe { (*this.bucket_lengths)[bucket_idx] };
+                let start_idx = bucket_idx * HASH_BUCKET_SIZE;
+                let bucket = unsafe { &(&*this.hashes)[start_idx..start_idx + len as usize] };
+
+                let shifted_hash = (hash.raw() >> 8) as u32;
+
+                match bucket.binary_search_by(|a| a.shifted_hash.cmp(&shifted_hash)) {
+                    Ok(idx) => Some(u24::from_u32(idx as u32)),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            }
+        })
     }
 
     pub fn intern_path(&mut self, cache: &mut InternerCache, path: &Utf8Path) -> SmolRange {
@@ -333,7 +370,7 @@ impl HashMemorySlab {
 
         let full_hash = Hash40::const_new(path.as_str());
 
-        if let Some(cached) = cache.cached_paths.get(&full_hash) {
+        if let Some(cached) = Self::try_cache_or_finalized_self(self, cache, full_hash) {
             unsafe {
                 return (*self.hashes)[cached.to_u32() as usize].range;
             }
@@ -344,7 +381,7 @@ impl HashMemorySlab {
             current = parent;
 
             let parent_hash = Hash40::const_new(current.as_str());
-            if let Some(cached) = cache.cached_paths.get(&parent_hash) {
+            if let Some(cached) = Self::try_cache_or_finalized_self(self, cache, parent_hash) {
                 debug_assert_eq!(cached.to_u32() & IS_INTERNED_COMPONENT, 0x0);
                 unsafe {
                     (*self.components)[self.component_len] =
@@ -422,6 +459,14 @@ impl HashMemorySlab {
                 (&mut (*self.hashes))[start_idx..start_idx + len]
                     .sort_unstable_by(|a, b| a.shifted_hash.cmp(&b.shifted_hash));
             }
+
+            let mut prev: Option<u32> = None;
+            for hash in unsafe { (&*self.hashes)[start_idx..start_idx + len].iter() } {
+                if let Some(prev) = prev {
+                    assert_ne!(hash.shifted_hash, prev);
+                }
+                prev = Some(hash.shifted_hash);
+            }
         }
 
         let mut relookup: Hash40Map<u24> = Hash40Map::default();
@@ -455,6 +500,8 @@ impl HashMemorySlab {
                     u24::from_u32(new_index.to_u32() | IS_INTERNED_COMPONENT);
             }
         }
+
+        self.was_finalized = true;
     }
 
     pub fn dump_blob(&self) -> Vec<u8> {
@@ -473,6 +520,85 @@ impl HashMemorySlab {
         meta.extend_from_slice(&self.component_len.to_le_bytes());
         meta
     }
+
+    pub fn components_for(&self, hash: Hash40) -> Option<ComponentIter<'_>> {
+        ComponentIter::new(self, hash)
+    }
+}
+
+pub struct ComponentIter<'a> {
+    slab: &'a HashMemorySlab,
+    range: SmolRange,
+    current: usize,
+    // Surely we can do this without actually making a box? Maybe a SmallVec for a stack of these?
+    // I really don't want to do allocations but this is a minor perf thing we can address later
+    nested: Option<Box<ComponentIter<'a>>>,
+}
+
+impl<'a> ComponentIter<'a> {
+    fn new(slab: &'a HashMemorySlab, hash: Hash40) -> Option<Self> {
+        // SAFETY: Within this function, we index into slices that we have properly set up in the constructor
+        let bucket_idx = hash.crc32() as usize % HASH_BUCKET_COUNT;
+        let len = unsafe { (*slab.bucket_lengths)[bucket_idx] };
+        let start_idx = bucket_idx * HASH_BUCKET_SIZE;
+        let bucket = unsafe { &(&(*slab.hashes))[start_idx..start_idx + len as usize] };
+
+        let shifted_hash = (hash.raw() >> 8) as u32;
+
+        match bucket.binary_search_by(|a| a.shifted_hash.cmp(&shifted_hash)) {
+            Ok(idx) => Some(Self {
+                slab,
+                range: unsafe { (*slab.hashes)[start_idx + idx].range },
+                current: 0,
+                nested: None,
+            }),
+            Err(_) => None,
+        }
+    }
+}
+
+impl<'a> Iterator for ComponentIter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(nested) = self.nested.as_mut() {
+            if let Some(next) = nested.next() {
+                return Some(next);
+            }
+            self.nested = None;
+        }
+
+        if self.current >= self.range.len() as usize {
+            return None;
+        }
+
+        let comp_idx = self.range.start().to_u32() as usize + self.current;
+        self.current += 1;
+        let string_idx = unsafe { (*self.slab.components)[comp_idx].to_u32() };
+        if string_idx & IS_INTERNED_COMPONENT != 0 {
+            let mut nested = ComponentIter {
+                slab: self.slab,
+                range: unsafe {
+                    (*self.slab.hashes)[(string_idx & !IS_INTERNED_COMPONENT) as usize].range
+                },
+                current: 0,
+                nested: None,
+            };
+
+            if let Some(next) = nested.next() {
+                self.nested = Some(Box::new(nested));
+                return Some(next);
+            } else {
+                unimplemented!("Interned component with no length?");
+            }
+        } else {
+            let string = unsafe { (*self.slab.strings)[string_idx as usize] };
+            let byte_start = string.start().to_u32() as usize;
+            let bytes =
+                unsafe { &(&*self.slab.bytes)[byte_start..byte_start + string.len() as usize] };
+            return Some(unsafe { std::str::from_utf8_unchecked(bytes) });
+        }
+    }
 }
 
 impl Drop for HashMemorySlab {
@@ -488,8 +614,15 @@ pub struct DisplayHash<'a> {
     pub hash: Hash40,
 }
 
+impl Debug for DisplayHash<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(self, f)
+    }
+}
+
 impl Display for DisplayHash<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Don't use component iter here since this can be done recursively where iter requires allocing memory
         write_hash(self.hash, self.slab, f)
     }
 }
@@ -531,12 +664,18 @@ pub fn write_hash(
     let bucket_idx = hash.crc32() as usize % HASH_BUCKET_COUNT;
     let len = unsafe { (*slab.bucket_lengths)[bucket_idx] };
     let start_idx = bucket_idx * HASH_BUCKET_SIZE;
-    let bucket = unsafe { &(&(*slab.hashes))[start_idx..start_idx + len as usize] };
+    let bucket = unsafe { &(&*slab.hashes)[start_idx..start_idx + len as usize] };
 
     let shifted_hash = (hash.raw() >> 8) as u32;
 
     match bucket.binary_search_by(|a| a.shifted_hash.cmp(&shifted_hash)) {
         Ok(idx) => write_hash_by_index(start_idx + idx, slab, f),
-        Err(_) => f.write_str("<unknown>"),
+        Err(_) => {
+            if f.alternate() {
+                f.write_str("<unknown>")
+            } else {
+                write!(f, "{:#x}", hash.raw())
+            }
+        }
     }
 }
