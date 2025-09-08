@@ -35,6 +35,10 @@ impl Hash40 {
         self.0
     }
 
+    pub const fn const_with_hash(self, other: Hash40) -> Self {
+        Self(const_hash::hash40_concat(self.0, other.0))
+    }
+
     pub const fn const_with(self, string: &str) -> Self {
         let other = Self::const_new(string);
         Self(const_hash::hash40_concat(self.0, other.0))
